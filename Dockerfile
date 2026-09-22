@@ -10,8 +10,8 @@ ENV NODE_ENV=production
 # Step 4: Copy package manifests first for optimal layer caching
 COPY package*.json ./
 
-# Step 5: Install only production dependencies cleanly
-RUN npm ci --only=production && npm cache clean --force
+# Step 5: Install only production dependencies (Fixed for missing lock file)
+RUN npm install --omit=dev && npm cache clean --force
 
 # Step 6: Copy the rest of the application files
 COPY . .
