@@ -8,12 +8,10 @@ const admin = require('firebase-admin');
 // ==========================================
 // 1. FIREBASE ADMIN INITIALIZATION
 // ==========================================
-// Ensure you set these environment variables in your Render dashboard
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
     clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    // Fixes formatting issues with private keys in environment variables
     privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined,
   })
 });
@@ -22,23 +20,21 @@ const db = admin.firestore();
 const app = express();
 
 // Middleware
-app.use(cors({ origin: true })); // Allows your PWA to call this API
+app.use(cors({ origin: true })); 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ==========================================
 // 2. SECURITY & RATE LIMITING
 // ==========================================
-// Prevents spam clicks from the Admin App exhausting Zoho limits
 const apiLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute window
-  max: 30, // Limit each IP to 30 requests per minute
+  windowMs: 1 * 60 * 1000, 
+  max: 30, 
   message: { error: "Too many requests. Please wait a minute and try again." },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// Middleware to verify Firebase Auth Token (Ensures only logged-in admins can approve orders)
 async function verifyAdminAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -47,7 +43,6 @@ async function verifyAdminAuth(req, res, next) {
   const idToken = authHeader.split('Bearer ')[1];
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    // Optional: Double-check Firestore to see if this user has admin: true
     const userDoc = await db.collection('users').doc(decodedToken.uid).get();
     if (!userDoc.exists || userDoc.data().admin !== true) {
       return res.status(403).json({ error: 'Forbidden: Admin privileges required' });
@@ -66,7 +61,6 @@ let cachedZohoToken = null;
 let tokenExpiryTime = 0;
 
 async function getZohoAccessToken() {
-  // Return cached token if it is still valid for at least 1 more minute
   if (cachedZohoToken && Date.now() < tokenExpiryTime) {
     return cachedZohoToken;
   }
@@ -75,7 +69,6 @@ async function getZohoAccessToken() {
     const response = await axios.post(url);
     
     cachedZohoToken = response.data.access_token;
-    // Set expiry (usually 3600 seconds), subtracting 60 seconds as a safety buffer
     tokenExpiryTime = Date.now() + (response.data.expires_in * 1000) - 60000;
     
     return cachedZohoToken;
@@ -105,13 +98,10 @@ function generateSearchKeywords(name = '', brand = '', category = '', sku = '') 
 // ==========================================
 // 5. ROUTES: ZOHO -> FIREBASE (WEBHOOKS)
 // ==========================================
-
-// Webhook: Triggered by Zoho when an item is Created or Updated
 app.post('/webhook/zoho-item-sync', async (req, res) => {
   try {
-    // Zoho webhooks usually send data inside a JSON string under a specific key, parse accordingly
     const payload = req.body.JSONString ? JSON.parse(req.body.JSONString) : req.body;
-    const item = payload.item; // Assumes Zoho Inventory item module payload
+    const item = payload.item; 
 
     if (!item || !item.item_id) {
       return res.status(400).json({ error: "Invalid payload format" });
@@ -120,7 +110,6 @@ app.post('/webhook/zoho-item-sync', async (req, res) => {
     const itemRef = db.collection('products').doc(item.item_id);
     const existingDoc = await itemRef.get();
 
-    // Prepare safe update payload
     const updateData = {
       name: item.name,
       sku: item.sku || "",
@@ -132,7 +121,6 @@ app.post('/webhook/zoho-item-sync', async (req, res) => {
       updatedAt: new Date().toISOString()
     };
 
-    // Only regenerate keywords if the item is brand new, or if text fields changed
     const isNew = !existingDoc.exists;
     const nameChanged = existingDoc.exists && existingDoc.data().name !== item.name;
     
@@ -140,9 +128,7 @@ app.post('/webhook/zoho-item-sync', async (req, res) => {
       updateData.searchKeywords = generateSearchKeywords(item.name, item.brand, item.category_name, item.sku);
     }
 
-    // merge: true PROTECTS YOUR CUSTOM IMAGES UPLOADED VIA ADMIN PWA
     await itemRef.set(updateData, { merge: true });
-
     res.status(200).json({ success: true, message: `Item ${item.item_id} synced.` });
   } catch (error) {
     console.error("Webhook Sync Error:", error);
@@ -150,7 +136,6 @@ app.post('/webhook/zoho-item-sync', async (req, res) => {
   }
 });
 
-// Webhook: Triggered by Zoho when an Invoice is created (Walk-in Sales)
 app.post('/webhook/zoho-invoice-sync', async (req, res) => {
   try {
     const payload = req.body.JSONString ? JSON.parse(req.body.JSONString) : req.body;
@@ -160,12 +145,10 @@ app.post('/webhook/zoho-invoice-sync', async (req, res) => {
       return res.status(400).json({ error: "Invalid invoice payload" });
     }
 
-    // Deduct stock for each line item sold in the physical shop
     const batch = db.batch();
     invoice.line_items.forEach(lineItem => {
       if (lineItem.item_id) {
         const itemRef = db.collection('products').doc(lineItem.item_id);
-        // decrement stock by the quantity sold
         batch.set(itemRef, {
           stock: admin.firestore.FieldValue.increment(-Math.abs(lineItem.quantity)),
           updatedAt: new Date().toISOString()
@@ -184,48 +167,40 @@ app.post('/webhook/zoho-invoice-sync', async (req, res) => {
 // ==========================================
 // 6. ROUTES: FIREBASE -> ZOHO (API APPROVAL)
 // ==========================================
-
-// Endpoint: Called by Admin PWA to approve an order and push it to Zoho
 app.post('/api/approve-zoho-order', apiLimiter, verifyAdminAuth, async (req, res) => {
   const { orderId } = req.body;
 
   if (!orderId) {
-    return res.status(400).json({ error: "Order ID is required." });
+    return res.status(400).json({ success: false, error: "Order ID is required." });
   }
 
   try {
-    // 1. Fetch order from Firebase
     const orderRef = db.collection('orders').doc(orderId);
     const orderDoc = await orderRef.get();
 
     if (!orderDoc.exists) {
-      return res.status(404).json({ error: "Order not found in Firebase." });
+      return res.status(404).json({ success: false, error: "Order not found in Firebase." });
     }
 
     const orderData = orderDoc.data();
 
-    // Prevent double-syncing
-    if (orderData.zoho_invoice_id || orderData.status === 'Approved') {
-      return res.status(400).json({ error: "Order is already synced or approved." });
+    if (orderData.zoho_invoice_id || orderData.status === 'approved') {
+      return res.status(400).json({ success: false, error: "Order is already synced or approved." });
     }
 
-    // 2. Prepare payload for Zoho Invoice/Sales Order API
-    // (Map Firebase cart items to Zoho line_items)
     const lineItems = orderData.items.map(item => ({
-      item_id: item.id, // Assumes item.id in Firebase is the Zoho item_id
+      item_id: item.id,
       quantity: item.qty,
       rate: item.price
     }));
 
-    // Example Zoho Invoice Payload (Adjust based on your exact Zoho settings)
     const zohoPayload = {
-      customer_id: process.env.ZOHO_DEFAULT_CUSTOMER_ID, // Use a default "Online Customer" ID, or map specific customers
+      customer_id: process.env.ZOHO_DEFAULT_CUSTOMER_ID,
       line_items: lineItems,
       shipping_charge: orderData.deliveryFee || 0,
       notes: `Online Order ID: ${orderId}. Address: ${orderData.deliveryAddress?.city}`
     };
 
-    // 3. Call Zoho API
     const accessToken = await getZohoAccessToken();
     const zohoUrl = `https://www.zohoapis.in/inventory/v1/invoices?organization_id=${process.env.ZOHO_ORG_ID}`;
     
@@ -237,20 +212,32 @@ app.post('/api/approve-zoho-order', apiLimiter, verifyAdminAuth, async (req, res
     });
 
     const zohoInvoiceId = zohoResponse.data.invoice.invoice_id;
+    const now = new Date().toISOString();
 
-    // 4. Update Firebase Order Status & Attach Zoho ID
     await orderRef.update({
-      status: 'Approved',
+      status: 'approved', 
       zoho_invoice_id: zohoInvoiceId,
-      approvedAt: new Date().toISOString(),
-      approvedBy: req.user.uid // Logs which admin clicked approve
+      zoho_invoice_status: 'generated',
+      approvedAt: now,
+      updatedAt: now,
+      approvedBy: req.user.uid 
     });
 
-    res.status(200).json({ success: true, message: "Order approved and synced to Zoho", zoho_invoice_id: zohoInvoiceId });
+    res.status(200).json({ 
+      success: true, 
+      message: "Order approved and synced to Zoho", 
+      zoho_invoice_id: zohoInvoiceId 
+    });
 
   } catch (error) {
-    console.error("Order Approval Error:", error.response?.data || error.message);
-    res.status(500).json({ error: "Failed to push order to Zoho ERP. Please try again." });
+    // Extracts exact error message from Zoho API, or falls back to standard error
+    const errorMessage = error.response?.data?.message || error.message || "Failed to push order to Zoho ERP. Please try again.";
+    console.error("Order Approval Error:", errorMessage);
+    
+    res.status(500).json({ 
+      success: false, 
+      error: errorMessage 
+    });
   }
 });
 
