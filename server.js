@@ -112,6 +112,7 @@ app.post('/webhook/zoho-item-sync', async (req, res) => {
 
     const updateData = {
       name: item.name,
+      description: item.description || "",
       sku: item.sku || "",
       price: Number(item.rate) || 0,
       stock: Number(item.stock_on_hand) || 0,
