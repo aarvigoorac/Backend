@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -12,6 +11,7 @@ admin.initializeApp({
   credential: admin.credential.cert({
     projectId: process.env.FIREBASE_PROJECT_ID,
     clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    // Safely handles newlines in the private key from cloud environment variables
     privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined,
   })
 });
@@ -55,31 +55,7 @@ async function verifyAdminAuth(req, res, next) {
 }
 
 // ==========================================
-// 3. ZOHO TOKEN MANAGEMENT
-// ==========================================
-let cachedZohoToken = null;
-let tokenExpiryTime = 0;
-
-async function getZohoAccessToken() {
-  if (cachedZohoToken && Date.now() < tokenExpiryTime) {
-    return cachedZohoToken;
-  }
-  try {
-    const url = `https://accounts.zoho.in/oauth/v2/token?refresh_token=${process.env.ZOHO_REFRESH_TOKEN}&client_id=${process.env.ZOHO_CLIENT_ID}&client_secret=${process.env.ZOHO_CLIENT_SECRET}&grant_type=refresh_token`;
-    const response = await axios.post(url);
-    
-    cachedZohoToken = response.data.access_token;
-    tokenExpiryTime = Date.now() + (response.data.expires_in * 1000) - 60000;
-    
-    return cachedZohoToken;
-  } catch (error) {
-    console.error("Error fetching Zoho Token:", error.response?.data || error.message);
-    throw new Error("Failed to authenticate with Zoho ERP.");
-  }
-}
-
-// ==========================================
-// 4. HELPER: FIREBASE KEYWORD GENERATOR
+// 3. HELPER: FIREBASE KEYWORD GENERATOR
 // ==========================================
 function generateSearchKeywords(name = '', brand = '', category = '', sku = '') {
   const keywords = {};
@@ -96,79 +72,57 @@ function generateSearchKeywords(name = '', brand = '', category = '', sku = '') 
 }
 
 // ==========================================
-// 5. ROUTES: ZOHO -> FIREBASE (WEBHOOKS)
+// 4. ROUTES: GOFRUGAL -> FIREBASE (INVENTORY WEBHOOK)
 // ==========================================
-app.post('/webhook/zoho-item-sync', async (req, res) => {
+// Gofrugal will hit this URL when an item is added or stock/price changes
+app.post('/webhook/gofrugal-item-sync', async (req, res) => {
   try {
-    const payload = req.body.JSONString ? JSON.parse(req.body.JSONString) : req.body;
-    const item = payload.item; 
+    // Gofrugal usually wraps the payload in an "items" array or sends a single object
+    const payload = req.body;
+    const itemsList = payload.items ? payload.items : [payload];
 
-    if (!item || !item.item_id) {
-      return res.status(400).json({ error: "Invalid payload format" });
-    }
-
-    const itemRef = db.collection('products').doc(item.item_id);
-    const existingDoc = await itemRef.get();
-
-    const updateData = {
-      name: item.name,
-      description: item.description || "",
-      sku: item.sku || "",
-      price: Number(item.rate) || 0,
-      stock: Number(item.stock_on_hand) || 0,
-      category: item.category_name || "General",
-      brand: item.brand || "",
-      isActive: item.status === "active",
-      updatedAt: new Date().toISOString()
-    };
-
-    const isNew = !existingDoc.exists;
-    const nameChanged = existingDoc.exists && existingDoc.data().name !== item.name;
-    
-    if (isNew || nameChanged) {
-      updateData.searchKeywords = generateSearchKeywords(item.name, item.brand, item.category_name, item.sku);
-    }
-
-    await itemRef.set(updateData, { merge: true });
-    res.status(200).json({ success: true, message: `Item ${item.item_id} synced.` });
-  } catch (error) {
-    console.error("Webhook Sync Error:", error);
-    res.status(500).json({ error: "Internal Server Error during sync" });
-  }
-});
-
-app.post('/webhook/zoho-invoice-sync', async (req, res) => {
-  try {
-    const payload = req.body.JSONString ? JSON.parse(req.body.JSONString) : req.body;
-    const invoice = payload.invoice;
-
-    if (!invoice || !invoice.line_items) {
-      return res.status(400).json({ error: "Invalid invoice payload" });
+    if (!itemsList || itemsList.length === 0) {
+      return res.status(400).json({ error: "Invalid Gofrugal payload format" });
     }
 
     const batch = db.batch();
-    invoice.line_items.forEach(lineItem => {
-      if (lineItem.item_id) {
-        const itemRef = db.collection('products').doc(lineItem.item_id);
-        batch.set(itemRef, {
-          stock: admin.firestore.FieldValue.increment(-Math.abs(lineItem.quantity)),
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
-      }
+
+    itemsList.forEach(item => {
+      if (!item.itemId) return; // Skip invalid entries
+      
+      const itemRef = db.collection('products').doc(item.itemId.toString());
+      
+      // Extract data from Gofrugal's specific nested "stock" array
+      const stockData = item.stock && item.stock.length > 0 ? item.stock[0] : {};
+
+      const updateData = {
+        name: item.itemName,
+        sku: stockData.itemReferenceCode || "",
+        price: Number(stockData.salePrice) || 0,
+        stock: Number(stockData.stock) || 0,
+        mrp: Number(stockData.mrp) || 0, // Helpful to show discounts
+        updatedAt: new Date().toISOString()
+      };
+
+      // Generate keywords for search engine
+      updateData.searchKeywords = generateSearchKeywords(item.itemName, "", "", stockData.itemReferenceCode);
+
+      batch.set(itemRef, updateData, { merge: true });
     });
 
     await batch.commit();
-    res.status(200).json({ success: true, message: "Firebase stock decremented." });
+    res.status(200).json({ success: true, message: `Successfully synced ${itemsList.length} items from Gofrugal.` });
   } catch (error) {
-    console.error("Invoice Webhook Error:", error);
-    res.status(500).json({ error: "Failed to process invoice webhook." });
+    console.error("Gofrugal Webhook Sync Error:", error);
+    res.status(500).json({ error: "Internal Server Error during Gofrugal sync" });
   }
 });
 
 // ==========================================
-// 6. ROUTES: FIREBASE -> ZOHO (API APPROVAL)
+// 5. ROUTES: FIREBASE -> GOFRUGAL (PUSH SALES ORDER)
 // ==========================================
-app.post('/api/approve-zoho-order', apiLimiter, verifyAdminAuth, async (req, res) => {
+// Your Admin/Agent PWA calls this when an order is Delivered
+app.post('/api/approve-gofrugal-order', apiLimiter, verifyAdminAuth, async (req, res) => {
   const { orderId } = req.body;
 
   if (!orderId) {
@@ -185,40 +139,61 @@ app.post('/api/approve-zoho-order', apiLimiter, verifyAdminAuth, async (req, res
 
     const orderData = orderDoc.data();
 
-    if (orderData.zoho_invoice_id || orderData.status === 'approved') {
-      return res.status(400).json({ success: false, error: "Order is already synced or approved." });
+    if (orderData.gofrugal_reference_no || orderData.status === 'approved') {
+      return res.status(400).json({ success: false, error: "Order is already synced to Gofrugal." });
     }
 
-    const lineItems = orderData.items.map(item => ({
-      item_id: item.id,
+    // Format the line items for Gofrugal
+    const mappedOrderItems = orderData.items.map((item, index) => ({
+      rowNo: index + 1,
+      itemId: item.id,
+      itemName: item.name,
       quantity: item.qty,
-      rate: item.price
+      salePrice: item.price,
+      itemAmount: item.qty * item.price
     }));
 
-    const zohoPayload = {
-      customer_id: process.env.ZOHO_DEFAULT_CUSTOMER_ID,
-      line_items: lineItems,
-      shipping_charge: orderData.deliveryFee || 0,
-      notes: `Online Order ID: ${orderId}. Address: ${orderData.deliveryAddress?.city}`
+    // Construct the exact JSON payload Gofrugal requires
+    const gofrugalPayload = {
+      salesOrder: {
+        onlineReferenceNo: orderId,
+        createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19), // Format: YYYY-MM-DD HH:MM:SS
+        status: "pending",
+        totalQuantity: orderData.items.reduce((sum, item) => sum + item.qty, 0),
+        totalAmount: orderData.totalAmount,
+        shippingCharge: orderData.deliveryFee || 0,
+        
+        // Customer Data Mapping
+        customerName: orderData.deliveryAddress?.name || "Online Customer",
+        customerMobile: orderData.deliveryAddress?.phone || "",
+        customerCity: orderData.deliveryAddress?.city || "",
+        customerAddressLine1: orderData.deliveryAddress?.house || "",
+        customerAddressLine2: orderData.deliveryAddress?.area || "",
+        customerPincode: orderData.deliveryAddress?.pincode || "",
+        
+        orderItems: mappedOrderItems
+      }
     };
 
-    const accessToken = await getZohoAccessToken();
-    const zohoUrl = `https://www.zohoapis.in/inventory/v1/invoices?organization_id=${process.env.ZOHO_ORG_ID}`;
+    // The URL Gofrugal provides you (e.g., http://[IP]/WebReporter/api/v1/salesOrders)
+    const gofrugalApiUrl = `${process.env.GOFRUGAL_API_URL}/salesOrders`;
     
-    const zohoResponse = await axios.post(zohoUrl, zohoPayload, {
+    // Push to Gofrugal using their Static Header Token
+    const gofrugalResponse = await axios.post(gofrugalApiUrl, gofrugalPayload, {
       headers: {
-        'Authorization': `Zoho-oauthtoken ${accessToken}`,
+        'X-Auth-Token': process.env.GOFRUGAL_AUTH_TOKEN,
+        'Accept': 'application/json',
         'Content-Type': 'application/json'
       }
     });
 
-    const zohoInvoiceId = zohoResponse.data.invoice.invoice_id;
     const now = new Date().toISOString();
 
+    // Mark as approved in Firebase
     await orderRef.update({
       status: 'approved', 
-      zoho_invoice_id: zohoInvoiceId,
-      zoho_invoice_status: 'generated',
+      gofrugal_reference_no: orderId, 
+      gofrugal_sync_status: 'success',
       approvedAt: now,
       updatedAt: now,
       approvedBy: req.user.uid 
@@ -226,14 +201,14 @@ app.post('/api/approve-zoho-order', apiLimiter, verifyAdminAuth, async (req, res
 
     res.status(200).json({ 
       success: true, 
-      message: "Order approved and synced to Zoho", 
-      zoho_invoice_id: zohoInvoiceId 
+      message: "Order successfully injected into Gofrugal ERP", 
+      orderId: orderId 
     });
 
   } catch (error) {
-    // Extracts exact error message from Zoho API, or falls back to standard error
-    const errorMessage = error.response?.data?.message || error.message || "Failed to push order to Zoho ERP. Please try again.";
-    console.error("Order Approval Error:", errorMessage);
+    // Graceful error extraction from Gofrugal's API
+    const errorMessage = error.response?.data?.message || error.message || "Failed to push order to Gofrugal ERP.";
+    console.error("Gofrugal Order Push Error:", errorMessage);
     
     res.status(500).json({ 
       success: false, 
@@ -243,9 +218,9 @@ app.post('/api/approve-zoho-order', apiLimiter, verifyAdminAuth, async (req, res
 });
 
 // ==========================================
-// 7. START SERVER
+// 6. START SERVER
 // ==========================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Aarvi Backend running on port ${PORT}`);
+  console.log(`🚀 Aarvi/Gofrugal Middleware running on port ${PORT}`);
 });
